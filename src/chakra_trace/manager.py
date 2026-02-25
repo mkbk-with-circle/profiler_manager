@@ -176,25 +176,51 @@ class ChakraTraceManager:
         if not self._running:
             return
 
+        # Mark stopped early to avoid re-entrancy
         self._running = False
 
         # Stop ET first
         if self._et is not None:
-            with suppress(Exception):
+            try:
                 self._et.stop()
-            with suppress(Exception):
+            except Exception as e:
+                self._log(f"ExecutionTraceObserver.stop() failed: {e}")
+            try:
                 self._et.unregister_callback()
+            except Exception as e:
+                self._log(f"ExecutionTraceObserver.unregister_callback() failed: {e}")
+            self._et = None
             self._log("ExecutionTraceObserver stopped.")
 
-        # Export Kineto + close profiler
+        # IMPORTANT:
+        # kineto_results is produced on profiler.stop(), which is triggered by __exit__.
+        # If you export BEFORE __exit__, kineto_results may still be None
+        # -> AttributeError: 'NoneType' object has no attribute 'save'
         if self._prof is not None:
-            with suppress(Exception):
-                if self.kineto_path:
-                    self._prof.export_chrome_trace(self.kineto_path)
-                    self._log(f"Kineto trace exported: {self.kineto_path}")
-            with suppress(Exception):
+            try:
+                if self.sync_cuda:
+                    with suppress(Exception):
+                        import torch
+                        if torch.cuda.is_available():
+                            torch.cuda.synchronize()
+
+                # 1) finalize/stop the profiler first
                 self._prof.__exit__(None, None, None)
-            self._prof = None
+
+                # 2) then export chrome trace
+                if self.kineto_path:
+                    self._log(f"Exporting chrome trace to: {self.kineto_path}")
+                    self._prof.export_chrome_trace(self.kineto_path)
+                    self._log(f"Kineto(chrome) trace exported: {self.kineto_path}")
+                else:
+                    self._log("kineto_path is None; skip export.")
+            except BaseException as e:
+                # Use BaseException so SystemExit during engine shutdown doesn't hide the root cause
+                import traceback
+                self._log(f"Profiler stop/export FAILED: {e}")
+                traceback.print_exc()
+            finally:
+                self._prof = None
 
         self._log("Profiler stopped.")
 
